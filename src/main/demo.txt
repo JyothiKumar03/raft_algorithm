@@ -1,0 +1,533 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+
+	// "os"
+	"strconv"
+	"sync"
+	"time"
+)
+
+// Define types for Raft nodes and log entries
+type node struct {
+	ID          int
+	State       string
+	Term        int
+	VotedFor    int
+	Log         []logEntry
+	CommitIndex int
+	LastApplied int
+	mutex       sync.Mutex
+	LeaderID    int
+	NextIndex   map[int]int
+	MatchIndex  map[int]int
+	timer       time.Duration // added timer field
+	isLeader    bool          // added isLeader field
+}
+
+// resetTimer sets the timer to 0 when the node transitions from candidate to leader
+func (n *node) resetTimer() {
+	if n.State != "leader" {
+		n.timer = 0
+	}
+}
+
+type logEntry struct {
+	Term    int
+	Command string
+}
+
+// Define types for Raft message requests and responses
+type voteRequest struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type voteResponse struct {
+	Term        int
+	VoteGranted bool
+}
+
+// Define global variables for node IDs and ports
+var nodeIDs = []int{1, 2, 3, 4, 5}
+var nodePorts = map[int]int{
+	1: 8081,
+	2: 8082,
+	3: 8083,
+	4: 8084,
+	5: 8085,
+}
+
+type requestVoteResponse struct {
+	Term        int  `json:"term"`
+	VoteGranted bool `json:"voteGranted"`
+}
+
+type appendEntriesRequest struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []logEntry
+	LeaderCommit int
+}
+
+type appendEntriesResponse struct {
+	Term    int  `json:"term"`
+	Success bool `json:"success"`
+}
+type requestVoteRequest struct { //from one to other nodes (sendrequest)
+	Term         int `json:"term"`
+	CandidateID  int `json:"candidateId"`
+	LastLogIndex int `json:"lastLogIndex"`
+	LastLogTerm  int `json:"lastLogTerm"`
+}
+
+type commandRequest struct {
+	Command string `json:"command"`
+}
+
+type commandResponse struct {
+	Result string `json:"result"`
+}
+
+// getLastLogIndexAndTerm returns the index and term of the last log entry in the node's log.
+func (n *node) getLastLogIndexAndTerm() (int, int) {
+	lastIndex := len(n.Log) - 1
+	return lastIndex, n.Log[lastIndex].Term
+}
+
+func (voter *node) requestVoteHandler(w http.ResponseWriter, r *http.Request) {
+	var req requestVoteRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := requestVoteResponse{
+		Term:        voter.Term,
+		VoteGranted: false,
+	}
+
+	if req.Term < voter.Term {
+		// Reply false if term < currentTerm (§5.1)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	if voter.VotedFor == -1 || voter.VotedFor == req.CandidateID {
+		// If votedFor is null or candidateId, and candidate’s log is at
+		// least as up-to-date as receiver’s log, grant vote
+		lastLogIndex, lastLogTerm := voter.getLastLogIndexAndTerm()
+		if req.LastLogTerm > lastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex) {
+			voter.VotedFor = req.CandidateID
+			resp.Term = voter.Term
+			resp.VoteGranted = true
+		}
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (leader *node) appendEntriesHandler(w http.ResponseWriter, r *http.Request) {
+	var req appendEntriesRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := appendEntriesResponse{
+		Term:    leader.Term,
+		Success: false,
+	}
+	if req.Term < leader.Term {
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	lastIndex, _ := leader.getLastLogIndexAndTerm()
+	if req.PrevLogIndex > lastIndex || (req.PrevLogIndex >= 0 && leader.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+	for i, entry := range req.Entries {
+		index := req.PrevLogIndex + i + 1
+		if index >= len(leader.Log) {
+			leader.Log = append(leader.Log, entry)
+		} else if leader.Log[index].Term != entry.Term {
+			leader.Log = leader.Log[:index]
+			leader.Log = append(leader.Log, entry)
+		}
+	}
+	if req.LeaderCommit > leader.CommitIndex {
+		lastIndex, _ := leader.getLastLogIndexAndTerm()
+		leader.CommitIndex = int(math.Min(float64(req.LeaderCommit), float64(lastIndex)))
+	}
+
+	resp.Term = leader.Term
+	resp.Success = true
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (n *node) executeCommandHandler(w http.ResponseWriter, r *http.Request, nodeIDs []int) {
+	var req commandRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := commandResponse{
+		Result: "Executed command: " + req.Command,
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+func sendHeartBeatToNode(port string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	url := fmt.Sprintf("http://localhost:%s/heartbeat", port)
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Println("Error sending heartbeat to node on port", port)
+		return
+	}
+	defer resp.Body.Close()
+	// Handle response as needed
+	fmt.Println("Heartbeat sent to node on port", port)
+}
+
+func heartBeat() {
+	var wg sync.WaitGroup
+	wg.Add(len(nodePorts))
+	ticker := time.NewTicker(time.Second * 1) // Set the ticker to 1 second
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, port := range nodePorts {
+				go sendHeartBeatToNode(strconv.Itoa(port), &wg)
+			}
+		}
+	}
+}
+
+// Implement sendVoteRequest function
+func (n *node) sendVoteRequestToNodes(vr voteRequest) error {
+
+	requestBodyBytes, err := json.Marshal(vr)
+	if err != nil {
+		fmt.Println("Error serializing VoteRequest:", err)
+		return err
+	}
+
+	var voteCount int = 0
+	var maxCount int = len(nodePorts)/2 + 1
+	// Iterate over the list of node ports
+	for _, port := range nodePorts {
+		// Construct the URL for the VoteRequest
+		url := fmt.Sprintf("http://localhost:%d/requestVote", port)
+
+		// Create a new HTTP POST request with the serialized JSON body
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBodyBytes))
+		if err != nil {
+			fmt.Println("Error creating HTTP request:", err)
+			continue
+		}
+
+		// Set the Content-Type header to indicate that the request body is JSON
+		req.Header.Set("Content-Type", "application/json")
+
+		// Send the HTTP request
+		client := http.Client{
+			Timeout: 5 * time.Second, // Set a timeout for the request
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Println("Error sending HTTP request:", err)
+			continue
+		}
+
+		// Check the response status code and handle accordingly
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Received non-OK response from %s: %s\n", url, resp.Status)
+			continue
+		}
+
+		// Read the response body
+		var vr voteResponse
+		err = json.NewDecoder(resp.Body).Decode(&vr)
+		if err != nil {
+			fmt.Println("Error decoding response body:", err)
+			continue
+		}
+		if vr.VoteGranted {
+			voteCount++
+		}
+		if voteCount >= maxCount {
+			n.isLeader = true
+			n.resetTimer()
+			heartBeat()
+		}
+		resp.Body.Close()
+
+	}
+	return nil
+}
+
+func sendAppendEntriesRequest(n *node, url string, req appendEntriesRequest) {
+	// Send the request to the target node
+	resp, err := sendAppendEntriesRPC(url, req)
+	if err != nil {
+		log.Printf("Failed to send appendEntries request to %s: %v\n", url, err)
+		return
+	}
+	// Handle the response from the target node
+	var aeResp appendEntriesResponse
+	err = json.Unmarshal(resp, &aeResp)
+	if err != nil {
+		log.Printf("Failed to parse appendEntries response from %s: %v\n", url, err)
+		return
+	}
+
+	if aeResp.Term > n.Term {
+		n.Term = aeResp.Term
+		n.LeaderID = 0
+		n.State = "follower"
+	} else if aeResp.Success {
+		n.State = "leader"
+	}
+}
+
+func sendAppendEntriesRPC(url string, req appendEntriesRequest) ([]byte, error) {
+	jsonReq, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %v", err)
+	}
+	resp, err := http.Post(url, "application/json", bytes.NewReader(jsonReq))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-200 response: %s", resp.Status)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	return respBody, nil
+}
+
+// Start election
+// startElection starts a new election
+func ElectionTimer() time.Duration {
+	// Generate a random seed based on the current time
+	rand.Seed(time.Now().UnixNano())
+
+	// Generate a random number between 0 and 15 (inclusive)
+	randomNumber := rand.Intn(16)
+
+	// Add 15 seconds to the random number to get a value in the range of 15 to 30 seconds
+	randomDuration := time.Duration(randomNumber+15) * time.Second
+
+	return randomDuration
+}
+
+// startElection starts a new election
+func (n *node) startElection() {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	// Increment the current term and transition to candidate state
+	n.Term++
+	n.State = "candidate"
+	n.VotedFor = n.ID
+
+	// Reset election timer and start it
+	n.resetTimer()
+	electionTimeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+	timeoutCh := time.After(electionTimeout)
+
+	// Send RequestVote RPCs to all other nodes in parallel
+	var wg sync.WaitGroup
+	votesCh := make(chan *voteResponse, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID != n.ID {
+			wg.Add(1)
+			go func(nodeID int) {
+				defer wg.Done()
+
+				var resp voteResponse
+				req := voteRequest{
+					Term:         n.Term,
+					CandidateID:  n.ID,
+					LastLogIndex: len(n.Log) - 1,
+					LastLogTerm:  n.Log[len(n.Log)-1].Term,
+				}
+				err := n.sendVoteRequestToNodes(req)
+				if err != nil {
+					log.Printf("Error sending RequestVote RPC to nodes: %v", err)
+				}
+				votesCh <- &resp
+			}(nodeID)
+		}
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	// Collect the votes and check if the election succeeded
+	var votesReceived int
+	var votesGranted int
+	for votesReceived < len(nodeIDs)-1 && votesGranted <= len(nodeIDs)/2 {
+		select {
+		case resp := <-votesCh:
+			votesReceived++
+			if resp.VoteGranted {
+				votesGranted++
+			}
+			if resp.Term > n.Term {
+				// Received a response with a higher term, so transition to follower state
+				n.Term = resp.Term
+				n.State = "follower"
+				return
+			}
+		case <-timeoutCh:
+			// Election timeout elapsed, so start a new election
+			log.Printf("Node %d election timeout", n.ID)
+			return
+		}
+	}
+
+	if votesGranted > len(nodeIDs)/2 {
+		// Received enough votes, so transition to leader state
+		n.State = "leader"
+		n.LeaderID = n.ID
+		n.NextIndex = make(map[int]int)
+		n.MatchIndex = make(map[int]int)
+		for _, nodeID := range nodeIDs {
+			n.NextIndex[nodeID] = len(n.Log)
+			n.MatchIndex[nodeID] = 0
+		}
+		log.Printf("Node %d elected as leader for term %d", n.ID, n.Term)
+	} else {
+		// Did not receive enough votes, so start a new election
+		log.Printf("Node %d did not receive enough votes in term %d", n.ID, n.Term)
+	}
+}
+func (n *node) GetStatusHandler(w http.ResponseWriter, r *http.Request) {
+	//status := "Follower"
+	if n.isLeader {
+		n.State = "Leader"
+	}
+	fmt.Fprintf(w, "Node %d is currently %s", n.ID, n.State)
+}
+func main() {
+	// Parse command line flags
+	port := flag.Int("port", 0, "Port to listen on")
+	//args := os.Args[1]
+	flag.Parse()
+
+	if *port == 0 {
+		log.Fatal("Please specify a port to listen on with -port")
+	}
+	//id, err := strconv.Atoi(args)
+
+	// Create the nodes
+	nodes := make(map[int]*node)
+	for i := 1; i <= 5; i++ {
+		if i == 1 {
+			// Create the leader node
+			nodes[i] = &node{
+				ID:          i,
+				State:       "leader",
+				VotedFor:    -1,
+				timer:       0,
+				mutex:       sync.Mutex{},
+				Log:         []logEntry{{Term: 0, Command: ""}},
+				NextIndex:   make(map[int]int),
+				MatchIndex:  make(map[int]int),
+				CommitIndex: 0,
+				isLeader:    true,
+			}
+		} else {
+			// Create the follower nodes
+			nodes[i] = &node{
+				ID:          i,
+				State:       "follower",
+				VotedFor:    -1,
+				timer:       0,
+				mutex:       sync.Mutex{},
+				Log:         []logEntry{{Term: 0, Command: ""}},
+				NextIndex:   make(map[int]int),
+				MatchIndex:  make(map[int]int),
+				CommitIndex: 0,
+			}
+		}
+	}
+	n := nodes[0]
+
+	// Set up HTTP handlers for the nodes
+	//for _, n := range nodes {
+	http.HandleFunc("/requestVote", n.requestVoteHandler)
+	http.HandleFunc("/appendEntries", n.appendEntriesHandler)
+	http.HandleFunc("/executeCommand", func(w http.ResponseWriter, r *http.Request) {
+		n.executeCommandHandler(w, r, nodeIDs)
+	})
+	http.HandleFunc("/status", n.GetStatusHandler)
+	//}
+
+	// Start HTTP servers for the nodes
+	for _, n := range nodes {
+		port := nodePorts[n.ID]
+		server := &http.Server{Addr: ":" + strconv.Itoa(port)}
+		go func(n *node) {
+			if err := server.ListenAndServe(); err != nil {
+				log.Fatalf("Failed to start HTTP server for node %v: %v", n.ID, err)
+			}
+		}(n)
+	}
+
+	// Start ticker to trigger elections and heartbeats
+	const electionTimeout = 300 // milliseconds
+	ticker := time.NewTicker(time.Millisecond * time.Duration(electionTimeout))
+	defer ticker.Stop()
+
+	// Main event loop
+	for {
+		select {
+		case <-ticker.C:
+			for _, n := range nodes {
+				n.timer++
+				if n.State == "follower" && n.timer >= electionTimeout {
+					n.timer = 0
+					n.State = "candidate"
+					go n.startElection()
+				} else if n.State == "leader" {
+					// Process data received from the Postman client
+					if n.isLeader {
+						// Process data received from the Postman client
+						// and send it to the followers
+						// ...
+					}
+				}
+			}
+		}
+	}
+}
+
+// case rpc := <-n.rpcChannel:
